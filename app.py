@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape
 
 st.set_page_config(page_title="Lọc lịch sát hạch Nguyễn Trình", layout="wide")
 st.title("Lọc lịch thi / sát hạch tại Trung tâm Nguyễn Trình")
-st.caption("Đọc trực tiếp bảng 5 cột trong PDF → lọc địa điểm Nguyễn Trình → xuất Word, PDF, Excel.")
+st.caption("Đọc bảng PDF → lọc địa điểm Nguyễn Trình → xuất Word, PDF, Excel. Tệp được phân tích một lần và lưu bộ nhớ đệm để tránh treo khi bấm nút.")
 
 VENUE_PATTERNS = [
     r"trung tâm giáo dục nghề nghiệp và sát hạch lái xe nguyễn trình",
@@ -95,8 +95,26 @@ def table_rows(pdf_bytes):
     rows, diagnostics = [], []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
-            tables = page.extract_tables() or []  # default table strategy worked on the supplied notice
-            diagnostics.append({"Trang": page_no, "Số bảng": len(tables), "Phương pháp": "bảng PDF mặc định"})
+            # Explicit line-based settings are generally faster and more predictable on ruled tables.
+            settings = {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "intersection_tolerance": 5,
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+                "edge_min_length": 10,
+            }
+            try:
+                tables = page.extract_tables(table_settings=settings) or []
+            except Exception:
+                tables = []
+            # Only try the default detector if line-based extraction found no table on this page.
+            if not tables:
+                try:
+                    tables = page.extract_tables() or []
+                except Exception:
+                    tables = []
+            diagnostics.append({"Trang": page_no, "Số bảng": len(tables), "Phương pháp": "đường kẻ / dự phòng mặc định"})
             for table in tables:
                 if not table:
                     continue
@@ -181,18 +199,23 @@ def fallback_text_rows(pdf_bytes):
             seen.add(key); unique.append(r)
     return unique
 
+@st.cache_data(show_spinner=False, max_entries=3)
 def extract_all(pdf_bytes):
+    """Cache extraction by exact PDF bytes so Streamlit reruns don't re-parse the file."""
     try:
         rows, diagnostics = table_rows(pdf_bytes)
-    except Exception:
-        rows, diagnostics = [], []
-    # If table extraction is suspiciously sparse, merge in fallback rows as review-only candidates.
+    except Exception as exc:
+        rows, diagnostics = [], [{"Lỗi": str(exc)[:300]}]
+    # Use fallback only when table extraction found almost nothing; keep candidates review-only.
     if len(rows) < 2:
-        fallback = fallback_text_rows(pdf_bytes)
-        existing = {(r["Ngày thi"], r["Trang"]) for r in rows}
-        for r in fallback:
-            if (r["Ngày thi"], r["Trang"]) not in existing:
-                rows.append(r)
+        try:
+            fallback = fallback_text_rows(pdf_bytes)
+            existing = {(r["Ngày thi"], r["Trang"]) for r in rows}
+            for r in fallback:
+                if (r["Ngày thi"], r["Trang"]) not in existing:
+                    rows.append(r)
+        except Exception as exc:
+            diagnostics.append({"Lỗi dự phòng": str(exc)[:300]})
     return rows, diagnostics
 
 
@@ -303,8 +326,11 @@ def make_pdf(df):
 
 uploaded = st.file_uploader("Tải thông báo lịch sát hạch PDF", type=["pdf"])
 if uploaded:
+    if uploaded.size > 20 * 1024 * 1024:
+        st.error("File lớn hơn 20 MB. Hãy nén PDF hoặc chia thành các file nhỏ hơn rồi tải lại.")
+        st.stop()
     pdf_bytes = uploaded.getvalue()
-    with st.spinner("Đang phân tích bảng PDF..."):
+    with st.spinner("Đang phân tích PDF lần đầu. Các lần tương tác tiếp theo sẽ dùng bộ nhớ đệm..."):
         rows, diagnostics = extract_all(pdf_bytes)
     if not rows:
         st.error("Không trích xuất được văn bản. Nếu đây là PDF scan, cần thêm OCR để đọc ảnh.")
