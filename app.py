@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape
 
 st.set_page_config(page_title="Lọc lịch sát hạch Nguyễn Trình", layout="wide")
 st.title("Lọc lịch thi / sát hạch tại Trung tâm Nguyễn Trình")
-st.caption("Đọc bảng PDF → lọc địa điểm Nguyễn Trình → xuất Word, PDF, Excel. Tệp được phân tích một lần và lưu bộ nhớ đệm để tránh treo khi bấm nút.")
+st.caption("Đọc trực tiếp bảng 5 cột trong PDF → lọc địa điểm Nguyễn Trình → xuất Word, PDF, Excel.")
 
 VENUE_PATTERNS = [
     r"trung tâm giáo dục nghề nghiệp và sát hạch lái xe nguyễn trình",
@@ -95,26 +95,8 @@ def table_rows(pdf_bytes):
     rows, diagnostics = [], []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
-            # Explicit line-based settings are generally faster and more predictable on ruled tables.
-            settings = {
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5,
-                "snap_tolerance": 3,
-                "join_tolerance": 3,
-                "edge_min_length": 10,
-            }
-            try:
-                tables = page.extract_tables(table_settings=settings) or []
-            except Exception:
-                tables = []
-            # Only try the default detector if line-based extraction found no table on this page.
-            if not tables:
-                try:
-                    tables = page.extract_tables() or []
-                except Exception:
-                    tables = []
-            diagnostics.append({"Trang": page_no, "Số bảng": len(tables), "Phương pháp": "đường kẻ / dự phòng mặc định"})
+            tables = page.extract_tables() or []  # default table strategy worked on the supplied notice
+            diagnostics.append({"Trang": page_no, "Số bảng": len(tables), "Phương pháp": "bảng PDF mặc định"})
             for table in tables:
                 if not table:
                     continue
@@ -199,23 +181,18 @@ def fallback_text_rows(pdf_bytes):
             seen.add(key); unique.append(r)
     return unique
 
-@st.cache_data(show_spinner=False, max_entries=3)
 def extract_all(pdf_bytes):
-    """Cache extraction by exact PDF bytes so Streamlit reruns don't re-parse the file."""
     try:
         rows, diagnostics = table_rows(pdf_bytes)
-    except Exception as exc:
-        rows, diagnostics = [], [{"Lỗi": str(exc)[:300]}]
-    # Use fallback only when table extraction found almost nothing; keep candidates review-only.
+    except Exception:
+        rows, diagnostics = [], []
+    # If table extraction is suspiciously sparse, merge in fallback rows as review-only candidates.
     if len(rows) < 2:
-        try:
-            fallback = fallback_text_rows(pdf_bytes)
-            existing = {(r["Ngày thi"], r["Trang"]) for r in rows}
-            for r in fallback:
-                if (r["Ngày thi"], r["Trang"]) not in existing:
-                    rows.append(r)
-        except Exception as exc:
-            diagnostics.append({"Lỗi dự phòng": str(exc)[:300]})
+        fallback = fallback_text_rows(pdf_bytes)
+        existing = {(r["Ngày thi"], r["Trang"]) for r in rows}
+        for r in fallback:
+            if (r["Ngày thi"], r["Trang"]) not in existing:
+                rows.append(r)
     return rows, diagnostics
 
 
@@ -232,77 +209,136 @@ def filter_venue(df):
     confirmed = df["Địa điểm sát hạch"].fillna("").astype(str).apply(is_venue)
     return df[confirmed].copy()
 
+def export_safe_df(df):
+    """Return plain Unicode strings; avoid pandas NA/extension values leaking into exporters."""
+    out = df.copy()
+    out.columns = [str(c) for c in out.columns]
+    for col in out.columns:
+        out[col] = out[col].map(lambda x: "" if x is None or (not isinstance(x, (list, dict)) and pd.isna(x)) else str(x))
+    return out
+
 def make_excel(df, all_df=None):
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     bio = BytesIO()
+    main = export_safe_df(df)
+    all_data = export_safe_df(all_df) if all_df is not None else None
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Dia diem Nguyen Trinh")
-        if all_df is not None:
-            all_df.to_excel(writer, index=False, sheet_name="Tat ca de kiem tra")
+        main.to_excel(writer, index=False, sheet_name="Lich Nguyen Trinh")
+        if all_data is not None:
+            all_data.to_excel(writer, index=False, sheet_name="Tat ca de kiem tra")
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
-            for col in ws.columns:
-                width = min(max(max(len(str(c.value or "")) for c in col) + 2 for c in [col[0]]), 55)
-                ws.column_dimensions[col[0].column_letter].width = width
+            ws.sheet_view.showGridLines = True
+            for cell in ws[1]:
+                cell.font = Font(name="Arial", bold=True, size=10)
+                cell.fill = PatternFill("solid", fgColor="D9E2F3")
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.font = Font(name="Arial", size=10)
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            for col_cells in ws.columns:
+                letter = col_cells[0].column_letter
+                max_len = max((len(str(c.value or "")) for c in col_cells), default=10)
+                ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 45)
     bio.seek(0)
     return bio.getvalue()
 
+def set_run_font(run, name="Arial", size=9, bold=None):
+    run.font.name = name
+    run.font.size = Pt(size)
+    if bold is not None:
+        run.bold = bold
+    # Set explicit font for East Asian/complex scripts too.
+    try:
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.rFonts
+        if rFonts is not None:
+            rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ascii', name)
+            rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hAnsi', name)
+            rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}eastAsia', name)
+            rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}cs', name)
+    except Exception:
+        pass
+
 def make_docx(df):
+    df = export_safe_df(df)
     doc = Document()
     sec = doc.sections[0]
-    sec.top_margin = Inches(.5); sec.bottom_margin = Inches(.5)
-    doc.add_heading("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH", 0)
+    sec.top_margin = Inches(.45); sec.bottom_margin = Inches(.45)
+    sec.left_margin = Inches(.4); sec.right_margin = Inches(.4)
+    heading = doc.add_heading("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH", 0)
+    for run in heading.runs: set_run_font(run, "Arial", 15, True)
     p = doc.add_paragraph("Danh sách trích xuất tự động. Vui lòng đối chiếu PDF gốc trước khi thông báo thí sinh.")
-    p.runs[0].font.size = Pt(9)
-    cols = ["STT", "Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
+    for run in p.runs: set_run_font(run, "Arial", 9)
+    cols = [c for c in ["STT", "Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"] if c in df.columns]
     table = doc.add_table(rows=1, cols=len(cols)); table.style = "Table Grid"
-    for i, c in enumerate(cols): table.rows[0].cells[i].text = c
+    table.autofit = True
+    for i, c in enumerate(cols):
+        cell = table.rows[0].cells[i]
+        cell.text = ""
+        r = cell.paragraphs[0].add_run(c); set_run_font(r, "Arial", 8, True)
     for _, row in df.iterrows():
         cells = table.add_row().cells
-        for i, c in enumerate(cols): cells[i].text = str(row.get(c, "") or "")
+        for i, c in enumerate(cols):
+            cells[i].text = ""
+            r = cells[i].paragraphs[0].add_run(str(row.get(c, "")))
+            set_run_font(r, "Arial", 8)
     bio = BytesIO(); doc.save(bio); bio.seek(0); return bio.getvalue()
 
 def rtf_escape(s):
+    # Encode RTF Unicode as UTF-16 code units, including surrogate pairs when needed.
     out = []
     for ch in str(s):
         if ch == "\\": out.append(r"\\")
         elif ch == "{": out.append(r"\{")
         elif ch == "}": out.append(r"\}")
         elif ch == "\n": out.append(r"\line ")
-        elif ord(ch) < 128: out.append(ch)
-        else: out.append(r"\u" + str(ord(ch) if ord(ch) < 32768 else ord(ch)-65536) + "?")
+        else:
+            code = ord(ch)
+            if 32 <= code < 127:
+                out.append(ch)
+            else:
+                encoded = ch.encode("utf-16-le")
+                units = [encoded[i] + (encoded[i+1] << 8) for i in range(0, len(encoded), 2)]
+                out.extend(r"\u" + str(u if u < 32768 else u - 65536) + "?" for u in units)
     return "".join(out)
 
 def make_doc(df):
-    cols = ["STT", "Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
-    parts = [r"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs18 ",
+    # .doc extension is an RTF document; use Unicode escapes instead of lossy ANSI conversion.
+    df = export_safe_df(df)
+    cols = [c for c in ["STT", "Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"] if c in df.columns]
+    parts = [r"{\rtf1\ansi\ansicpg1252\deff0\uc1{\fonttbl{\f0\fnil Arial;}}\viewkind4\f0\fs18 ",
              r"\b " + rtf_escape("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH") + r"\b0\par\par ",
              rtf_escape("Danh sách trích xuất tự động. Vui lòng đối chiếu PDF gốc trước khi thông báo thí sinh.") + r"\par\par "]
     parts.append(r"\b " + r" | ".join(rtf_escape(c) for c in cols) + r"\b0\par ")
     for _, row in df.iterrows():
-        parts.append(" | ".join(rtf_escape(row.get(c, "") or "") for c in cols) + r"\par ")
+        parts.append(" | ".join(rtf_escape(row.get(c, "")) for c in cols) + r"\par ")
     parts.append("}")
-    return "".join(parts).encode("ascii", errors="ignore")
+    return "".join(parts).encode("ascii", errors="strict")
 
 def make_pdf(df):
+    df = export_safe_df(df)
     bio = BytesIO()
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     import os
     from pathlib import Path
-    font_regular = str(Path(__file__).with_name("DejaVuSans.ttf"))
-    font_bold = str(Path(__file__).with_name("DejaVuSans-Bold.ttf"))
-    if os.path.exists(font_regular):
-        try:
-            pdfmetrics.registerFont(TTFont("Vietnamese", font_regular))
-            if os.path.exists(font_bold):
-                pdfmetrics.registerFont(TTFont("Vietnamese-Bold", font_bold))
-            regular_name = "Vietnamese"
-            bold_name = "Vietnamese-Bold" if os.path.exists(font_bold) else "Vietnamese"
-        except Exception:
-            regular_name, bold_name = "Helvetica", "Helvetica-Bold"
-    else:
-        regular_name, bold_name = "Helvetica", "Helvetica-Bold"
+    # Bundle and embed Unicode fonts in the PDF. Do not silently fall back to Helvetica,
+    # because standard PDF fonts do not reliably render Vietnamese diacritics.
+    font_regular = Path(__file__).with_name("DejaVuSans.ttf")
+    font_bold = Path(__file__).with_name("DejaVuSans-Bold.ttf")
+    if not font_regular.exists() or not font_bold.exists():
+        raise RuntimeError("Thiếu font tiếng Việt DejaVuSans.ttf hoặc DejaVuSans-Bold.ttf trong bộ cài.")
+    try:
+        if "Vietnamese" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("Vietnamese", str(font_regular)))
+        if "Vietnamese-Bold" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("Vietnamese-Bold", str(font_bold)))
+    except Exception as exc:
+        raise RuntimeError(f"Không nạp được font Unicode tiếng Việt: {exc}") from exc
+    regular_name, bold_name = "Vietnamese", "Vietnamese-Bold"
 
     styles = getSampleStyleSheet()
     title = ParagraphStyle("TitleVN", parent=styles["Title"], fontName=bold_name, fontSize=12, leading=15, alignment=TA_CENTER)
@@ -326,11 +362,8 @@ def make_pdf(df):
 
 uploaded = st.file_uploader("Tải thông báo lịch sát hạch PDF", type=["pdf"])
 if uploaded:
-    if uploaded.size > 20 * 1024 * 1024:
-        st.error("File lớn hơn 20 MB. Hãy nén PDF hoặc chia thành các file nhỏ hơn rồi tải lại.")
-        st.stop()
     pdf_bytes = uploaded.getvalue()
-    with st.spinner("Đang phân tích PDF lần đầu. Các lần tương tác tiếp theo sẽ dùng bộ nhớ đệm..."):
+    with st.spinner("Đang phân tích bảng PDF..."):
         rows, diagnostics = extract_all(pdf_bytes)
     if not rows:
         st.error("Không trích xuất được văn bản. Nếu đây là PDF scan, cần thêm OCR để đọc ảnh.")
@@ -347,7 +380,7 @@ if uploaded:
     review = df[df["Ghi chú kiểm tra"].astype(str).str.contains("CHƯA XÁC NHẬN|Cần kiểm tra", case=False, na=False)].copy()
 
     st.success(f"Trích xuất được {len(df)} dòng ứng viên; nhận diện trực tiếp {len(filtered)} dòng có địa điểm Nguyễn Trình.")
-    st.warning("Để hạn chế bỏ sót, hãy xem cả bảng 'Cần rà soát thủ công'. Nếu cột địa điểm không được nhận diện từ PDF, chương trình không tự coi đó là kết quả đã xác nhận.")
+    st.warning("Để hạn chế bỏ sót, hãy xem cả bảng 'Cần rà soát thủ công'. Nếu chữ trong bảng trên đã sai dấu hoặc biến thành ký tự lạ, đó là lỗi trích xuất từ PDF gốc; cần OCR/đọc lại nguồn trước khi xuất. Font nhúng chỉ sửa cách hiển thị PDF đầu ra, không thể tự khôi phục ký tự đã đọc sai.")
     st.subheader("A. Kết quả xác nhận theo cột địa điểm sát hạch")
     edited = st.data_editor(filtered, num_rows="dynamic", use_container_width=True, key="confirmed")
     st.subheader("B. Cần rà soát thủ công để tránh bỏ sót")
@@ -362,10 +395,17 @@ if uploaded:
         st.json(diagnostics)
     if len(edited):
         col1, col2, col3, col4 = st.columns(4)
-        col1.download_button("Tải Word .doc", make_doc(edited), "lich_sat_hach_nguyen_trinh.doc", "application/msword")
-        col2.download_button("Tải Word .docx", make_docx(edited), "lich_sat_hach_nguyen_trinh.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        col3.download_button("Tải PDF", make_pdf(edited), "lich_sat_hach_nguyen_trinh.pdf", "application/pdf")
-        col4.download_button("Tải Excel", make_excel(edited, df), "lich_sat_hach_nguyen_trinh.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        try:
+            doc_bytes = make_doc(edited)
+            docx_bytes = make_docx(edited)
+            pdf_bytes_out = make_pdf(edited)
+            xlsx_bytes = make_excel(edited, df)
+            col1.download_button("Tải Word .doc", doc_bytes, "lich_sat_hach_nguyen_trinh.doc", "application/msword")
+            col2.download_button("Tải Word .docx", docx_bytes, "lich_sat_hach_nguyen_trinh.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            col3.download_button("Tải PDF", pdf_bytes_out, "lich_sat_hach_nguyen_trinh.pdf", "application/pdf")
+            col4.download_button("Tải Excel", xlsx_bytes, "lich_sat_hach_nguyen_trinh.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as exc:
+            st.error(f"Không tạo được file xuất: {exc}")
     elif len(review):
         st.info("Chưa có dòng nào được xác nhận tự động. Hãy kiểm tra bảng rà soát và PDF gốc; có thể sửa bảng dữ liệu trước khi xuất.")
 else:
