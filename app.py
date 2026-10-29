@@ -67,6 +67,19 @@ def col_role(header):
         return "venue"
     return ""
 
+def parse_grade_count(cell):
+    """Extract driving-license grades and an explicit quantity from the quantity column."""
+    text = norm(cell)
+    grade_match = re.search(r"(?i)\b(?:hạng\s*)?((?:B01|B|C1|C|D2|D|CE|A1|A)(?:\s*[,;/]\s*(?:B01|B|C1|C|D2|D|CE|A1|A))*)\b", text)
+    grades = ""
+    if grade_match:
+        grades = re.sub(r"\s+", " ", grade_match.group(1)).strip(" ,;/")
+        grades = re.sub(r"\s*[,;/]\s*", ", ", grades)
+    # Quantity normally appears as a standalone integer (e.g. 200, 500, 650).
+    nums = re.findall(r"(?<!\d)(\d{1,4})(?!\d)", text)
+    count = nums[-1] if nums else ""
+    return grades, count
+
 def table_rows(pdf_bytes):
     rows = []
     table_diagnostics = []
@@ -90,61 +103,75 @@ def table_rows(pdf_bytes):
             for table in tables:
                 if not table:
                     continue
-                # Header may appear on page 1 only; infer column roles from first rows.
                 header_idx = None
                 roles = {}
-                for ridx, row in enumerate(table[:5]):
+                for ridx, row in enumerate(table[:6]):
                     cells = [norm(c) for c in (row or [])]
                     joined = " ".join(cells)
-                    if any(k in fold(joined) for k in ["co so dao tao", "thoi gian sat hach", "dia diem to chuc sat hach"]):
+                    fjoined = fold(joined)
+                    if any(k in fjoined for k in ["co so dao tao", "thoi gian sat hach", "dia diem to chuc sat hach"]):
                         header_idx = ridx
                         for ci, cell in enumerate(cells):
                             role = col_role(cell)
                             if role:
                                 roles[role] = ci
+                            fc = fold(cell)
+                            if "so luong" in fc or "du kien sat hach" in fc:
+                                roles["count"] = ci
                         break
 
                 for ridx, row in enumerate(table):
                     cells = [norm(c) for c in (row or [])]
-                    if not any(cells):
+                    if not any(cells) or (header_idx is not None and ridx <= header_idx):
                         continue
                     joined = " | ".join(c for c in cells if c)
-                    if header_idx is not None and ridx <= header_idx:
+                    if re.search(r"(?i)cơ sở đào tạo|thời gian sát hạch|địa điểm tổ chức sát hạch", joined):
                         continue
 
-                    # Find date by looking first in detected date column, then across cells.
-                    date = ""
-                    date_col = roles.get("date")
-                    if date_col is not None and date_col < len(cells):
-                        date = date_norm(cells[date_col])
+                    # Table layout in the source notice: STT | training provider | grades/count | date | venue.
+                    # Prefer detected headers; use this layout when headers are absent on continuation pages.
+                    date_col = roles.get("date", 3 if len(cells) >= 5 else None)
+                    date = date_norm(cells[date_col]) if date_col is not None and date_col < len(cells) else ""
                     if not date:
                         date = date_norm(joined)
                     if not date:
-                        # Continuation rows can contain venue text without a date.
                         if rows and rows[-1]["Trang"] == pageno and joined:
-                            # Append only when likely to be a continuation of the previous row.
                             rows[-1]["Raw PDF row"] += " | " + joined
                             if not rows[-1]["Địa điểm sát hạch"]:
                                 rows[-1]["Địa điểm sát hạch"] = joined
                                 rows[-1]["Ghi chú kiểm tra"] = "Cần xác minh: có dòng nối tiếp"
                         continue
 
-                    provider = cells[roles["provider"]] if "provider" in roles and roles["provider"] < len(cells) else ""
-                    venue = cells[roles["venue"]] if "venue" in roles and roles["venue"] < len(cells) else ""
+                    provider_col = roles.get("provider", 1 if len(cells) >= 2 else None)
+                    provider = cells[provider_col] if provider_col is not None and provider_col < len(cells) else ""
 
-                    # Fallback for documents with no repeated column header: use table shape.
-                    if not venue and len(cells) >= 4:
-                        venue = cells[-1]
-                    if not provider and len(cells) >= 2:
-                        provider = cells[1]
+                    count_col = roles.get("count", 2 if len(cells) >= 5 else None)
+                    count_cell = cells[count_col] if count_col is not None and count_col < len(cells) else ""
+                    grades, quantity = parse_grade_count(count_cell)
 
+                    venue_col = roles.get("venue", 4 if len(cells) >= 5 else (len(cells)-1 if len(cells) >= 4 else None))
+                    venue = cells[venue_col] if venue_col is not None and venue_col < len(cells) else ""
+
+                    # Some PDF extractors merge the venue into the final cell or shift columns.
+                    if not is_venue(venue):
+                        candidates = [c for c in cells if is_venue(c)]
+                        if candidates:
+                            venue = candidates[-1]
+
+                    note = "Đã nhận diện cột"
+                    if not provider or not venue:
+                        note = "Cần kiểm tra: cột chưa nhận diện chắc chắn"
+                    if not quantity:
+                        note += "; chưa đọc được số lượng"
                     rows.append({
                         "Ngày thi": date,
                         "Cơ sở đào tạo": provider,
+                        "Hạng thi": grades,
+                        "Số lượng học viên dự kiến": quantity,
                         "Địa điểm sát hạch": venue,
                         "Raw PDF row": joined,
                         "Trang": pageno,
-                        "Ghi chú kiểm tra": "Đã nhận diện cột" if (provider and venue) else "Cần kiểm tra: cột chưa nhận diện chắc chắn",
+                        "Ghi chú kiểm tra": note,
                     })
                 table_diagnostics.append({"Trang": pageno, "Số bảng": len(tables), "Cột": str(roles)})
     return rows, table_diagnostics
@@ -164,6 +191,8 @@ def fallback_text_rows(pdf_bytes):
             out.append({
                 "Ngày thi": dt,
                 "Cơ sở đào tạo": "",
+                "Hạng thi": "",
+                "Số lượng học viên dự kiến": "",
                 "Địa điểm sát hạch": "",
                 "Raw PDF row": chunk,
                 "Trang": pageno,
@@ -189,6 +218,14 @@ def extract_all(pdf_bytes):
             if (r["Ngày thi"], r["Trang"]) not in existing:
                 rows.append(r)
     return rows, diagnostics
+
+
+def shorten_provider(text):
+    s = str(text or "")
+    s = re.sub(r"(?i)Trung tâm Giáo dục nghề nghiệp và Sát hạch lái xe Nguyễn Trình", "Nguyễn Trình", s)
+    s = re.sub(r"(?i)Trung tâm GDNN và SHLX Nguyễn Trình", "Nguyễn Trình", s)
+    s = re.sub(r"(?i)Trung tâm GDNN & SHLX Nguyễn Trình", "Nguyễn Trình", s)
+    return s
 
 def filter_venue(df):
     if df.empty:
@@ -218,7 +255,7 @@ def make_docx(df):
     doc.add_heading("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH", 0)
     p = doc.add_paragraph("Danh sách trích xuất tự động. Vui lòng đối chiếu PDF gốc trước khi thông báo thí sinh.")
     p.runs[0].font.size = Pt(9)
-    cols = ["Ngày thi", "Cơ sở đào tạo", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
+    cols = ["Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
     table = doc.add_table(rows=1, cols=len(cols)); table.style = "Table Grid"
     for i, c in enumerate(cols): table.rows[0].cells[i].text = c
     for _, row in df.iterrows():
@@ -238,7 +275,7 @@ def rtf_escape(s):
     return "".join(out)
 
 def make_doc(df):
-    cols = ["Ngày thi", "Cơ sở đào tạo", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
+    cols = ["Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
     parts = [r"{\rtf1\ansi\deff0{\fonttbl{\f0 Arial;}}\f0\fs18 ",
              r"\b " + rtf_escape("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH") + r"\b0\par\par ",
              rtf_escape("Danh sách trích xuất tự động. Vui lòng đối chiếu PDF gốc trước khi thông báo thí sinh.") + r"\par\par "]
@@ -250,19 +287,41 @@ def make_doc(df):
 
 def make_pdf(df):
     bio = BytesIO()
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os
+    font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if os.path.exists(font_regular):
+        try:
+            pdfmetrics.registerFont(TTFont("Vietnamese", font_regular))
+            if os.path.exists(font_bold):
+                pdfmetrics.registerFont(TTFont("Vietnamese-Bold", font_bold))
+            regular_name = "Vietnamese"
+            bold_name = "Vietnamese-Bold" if os.path.exists(font_bold) else "Vietnamese"
+        except Exception:
+            regular_name, bold_name = "Helvetica", "Helvetica-Bold"
+    else:
+        regular_name, bold_name = "Helvetica", "Helvetica-Bold"
+
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("Title2", parent=styles["Title"], fontSize=13, leading=16, alignment=TA_CENTER)
-    body = ParagraphStyle("Body2", parent=styles["BodyText"], fontSize=7, leading=9, wordWrap="CJK")
-    doc = SimpleDocTemplate(bio, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=22, bottomMargin=22)
+    title = ParagraphStyle("TitleVN", parent=styles["Title"], fontName=bold_name, fontSize=12, leading=15, alignment=TA_CENTER)
+    body = ParagraphStyle("BodyVN", parent=styles["BodyText"], fontName=regular_name, fontSize=6.5, leading=8, wordWrap="CJK")
+    doc = SimpleDocTemplate(bio, pagesize=landscape(A4), rightMargin=16, leftMargin=16, topMargin=20, bottomMargin=20)
     story = [Paragraph("LỊCH SÁT HẠCH TẠI TRUNG TÂM NGUYỄN TRÌNH", title), Spacer(1, 8),
              Paragraph("Danh sách trích xuất tự động. Vui lòng đối chiếu PDF gốc trước khi thông báo thí sinh.", body), Spacer(1, 8)]
-    cols = ["Ngày thi", "Cơ sở đào tạo", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
+    cols = ["Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Trang", "Ghi chú kiểm tra"]
     data = [[Paragraph(escape(c), body) for c in cols]]
     for _, row in df.iterrows():
         data.append([Paragraph(escape(str(row.get(c, "") or "")), body) for c in cols])
-    tbl = Table(data, colWidths=[65, 180, 180, 30, 260], repeatRows=1)
-    tbl.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.lightgrey),("GRID",(0,0),(-1,-1),.4,colors.grey),
-                             ("VALIGN",(0,0),(-1,-1),"TOP"),("FONTSIZE",(0,0),(-1,-1),7)]))
+    tbl = Table(data, colWidths=[55, 125, 55, 65, 165, 25, 120], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.lightgrey), ("GRID",(0,0),(-1,-1),.4,colors.grey),
+        ("VALIGN",(0,0),(-1,-1),"TOP"), ("FONTNAME",(0,0),(-1,0),bold_name),
+        ("FONTNAME",(0,1),(-1,-1),regular_name), ("FONTSIZE",(0,0),(-1,-1),6.5),
+        ("LEFTPADDING",(0,0),(-1,-1),3), ("RIGHTPADDING",(0,0),(-1,-1),3),
+        ("TOPPADDING",(0,0),(-1,-1),3), ("BOTTOMPADDING",(0,0),(-1,-1),3)
+    ]))
     story.append(tbl); doc.build(story); bio.seek(0); return bio.getvalue()
 
 uploaded = st.file_uploader("Tải thông báo lịch sát hạch PDF", type=["pdf"])
@@ -274,11 +333,15 @@ if uploaded:
         st.error("Không trích xuất được văn bản. Nếu đây là PDF scan, cần thêm OCR để đọc ảnh.")
         st.stop()
     df = pd.DataFrame(rows)
-    for c in ["Ngày thi", "Cơ sở đào tạo", "Địa điểm sát hạch", "Raw PDF row", "Trang", "Ghi chú kiểm tra"]:
+    for c in ["Ngày thi", "Cơ sở đào tạo", "Hạng thi", "Số lượng học viên dự kiến", "Địa điểm sát hạch", "Raw PDF row", "Trang", "Ghi chú kiểm tra"]:
         if c not in df: df[c] = ""
     df["_sort"] = pd.to_datetime(df["Ngày thi"], format="%d/%m/%Y", errors="coerce")
     df = df.sort_values(["_sort", "Trang"], kind="stable").drop(columns=["_sort"])
     filtered = filter_venue(df)
+    if "Cơ sở đào tạo" in filtered.columns:
+        filtered["Cơ sở đào tạo"] = filtered["Cơ sở đào tạo"].apply(shorten_provider)
+    if "Địa điểm sát hạch" in filtered.columns:
+        filtered["Địa điểm sát hạch"] = filtered["Địa điểm sát hạch"].apply(shorten_provider)
     review = df[df["Ghi chú kiểm tra"].astype(str).str.contains("CHƯA XÁC NHẬN|Cần kiểm tra", case=False, na=False)].copy()
 
     st.success(f"Trích xuất được {len(df)} dòng ứng viên; nhận diện trực tiếp {len(filtered)} dòng có địa điểm Nguyễn Trình.")
